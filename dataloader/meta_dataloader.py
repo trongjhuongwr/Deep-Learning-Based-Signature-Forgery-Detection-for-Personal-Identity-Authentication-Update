@@ -1,192 +1,183 @@
 import torch
 from torch.utils.data import Dataset
-import random
-import json
-from PIL import Image
 import os
-from torchvision import transforms
+import random
+import re
+from PIL import Image
 
 class SignatureEpisodeDataset(Dataset):
     """
-    A PyTorch Dataset class for creating few-shot learning episodes for signature verification.
-
-    Each item retrieved from this dataset represents one "episode" or "task",
-    simulating the scenario of adapting to a new user with limited samples.
-    An episode consists of a support set (known genuine samples) and a query set
-    (samples to be classified, including both genuine and forged).
+    Dataset for Few-Shot Learning (Meta-Learning) specifically designed to prevent Data Leakage.
+    
+    It generates 'Episodes' (Tasks) consisting of:
+    - Support Set: k_shot genuine signatures from a specific user.
+    - Query Set: q_query genuine signatures + q_query forged signatures from the same user.
+    
+    Key Feature:
+    - specific_users: A list of User IDs allowed in this dataset. Ideally used to enforce
+      strict splitting (e.g., Users 1-39 for Train, 40-44 for Val).
     """
-    def __init__(self, split_file_path, base_data_dir, split_name, k_shot=10, n_query_genuine=15, n_query_forgery=15, augment=False, use_full_path=False):
+    def __init__(self, org_dir, forg_dir, n_way=2, k_shot=5, q_query=5, specific_users=None, transform=None):
         """
-        Initializes the SignatureEpisodeDataset.
-
         Args:
-            split_file_path (str): Path to the JSON file containing user IDs and image paths for the split (e.g., meta-train, meta-test).
-            base_data_dir (str): Root directory of the dataset (e.g., '/kaggle/input/cedar-dataset/signatures'). Used only if use_full_path is False.
-            split_name (str): The name of the split to load ('meta-train' or 'meta-test').
-            k_shot (int): Number of genuine samples in the support set.
-            n_query_genuine (int): Number of genuine samples in the query set.
-            n_query_forgery (int): Number of forgery samples in the query set.
-            augment (bool): Whether to apply data augmentation (RandomAffine) to the images. Should be True for training, False for evaluation.
-            use_full_path (bool): If True, treats paths in the JSON file as absolute paths. If False, joins paths with base_data_dir.
+            org_dir (str): Path to the directory containing genuine signatures.
+            forg_dir (str): Path to the directory containing forged signatures.
+            n_way (int): Number of classes (usually 2 for Genuine vs Forgery, though Metric Learning often treats it as One-Class).
+            k_shot (int): Number of genuine samples in Support Set.
+            q_query (int): Number of samples per class in Query Set (e.g., 5 gen + 5 forg).
+            specific_users (list[int]): List of allowed User IDs. If None, uses all found users.
+            transform (callable): PyTorch transforms to apply to images.
         """
-        try:
-            with open(split_file_path, 'r') as f:
-                split_content = json.load(f)[split_name]
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Split file not found at: {split_file_path}")
-        except KeyError:
-            raise KeyError(f"Split name '{split_name}' not found in the JSON file.")
-
-        self.data = {}
-        if use_full_path:
-            # Assumes JSON contains absolute paths
-            self.data = split_content
-        else:
-            # Constructs absolute paths by joining base_data_dir
-            if base_data_dir is None:
-                raise ValueError("base_data_dir must be provided when use_full_path is False")
-            for user_id, paths in split_content.items():
-                # Make sure user_id is stored as string consistently
-                str_user_id = str(user_id)
-                self.data[str_user_id] = {
-                    'genuine': [os.path.join(base_data_dir, p) for p in paths['genuine']],
-                    'forgery': [os.path.join(base_data_dir, p) for p in paths['forgery']]
-                }
-
-        # Store user IDs as strings for consistent dictionary access
-        self.user_ids = list(self.data.keys())
+        self.org_dir = org_dir
+        self.forg_dir = forg_dir
+        self.n_way = n_way
         self.k_shot = k_shot
-        self.n_query_genuine = n_query_genuine
-        self.n_query_forgery = n_query_forgery
-        self.augment = augment
-        self.length = len(self.user_ids) # Number of users/episodes in this split
+        self.q_query = q_query
+        self.transform = transform
+        self.specific_users = specific_users
 
-        # Define image transformations
-        self.base_transform = transforms.Compose([
-            transforms.Resize((220, 150)),
-            transforms.Grayscale(), # Ensure single channel first
-            transforms.ToTensor(), # Converts to [0, 1] range and CxHxW format
-            transforms.Lambda(lambda x: x.repeat(3, 1, 1)), # Convert grayscale to 3 channels for ResNet
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]) # Normalize to [-1, 1] range
-        ])
+        # Dictionary to store image paths: {user_id: {'org': [], 'forg': []}}
+        self.user_data = {}
+        
+        # Supported image extensions
+        self.valid_exts = ('.png', '.jpg', '.jpeg', '.tif', '.bmp')
 
-        # Augmentation transform includes random affine transformations
-        self.augment_transform = transforms.Compose([
-            transforms.Resize((220, 150)),
-            transforms.Grayscale(),
-            # Slight random rotations, translations, and scaling
-            transforms.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x.repeat(3, 1, 1)),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
+        print(f"Initializing SignatureEpisodeDataset...")
+        if specific_users:
+            print(f"Filter active: Loading data ONLY for {len(specific_users)} specific users.")
+        else:
+            print("Warning: No user filter applied. Loading all users found.")
 
-        print(f"Initialized SignatureEpisodeDataset for '{split_name}' split.")
-        print(f"  Number of users/episodes: {self.length}")
-        print(f"  k_shot: {self.k_shot}, n_query_genuine: {self.n_query_genuine}, n_query_forgery: {self.n_query_forgery}")
-        print(f"  Augmentation: {'Enabled' if self.augment else 'Disabled'}")
-        print(f"  Using full paths: {use_full_path}")
+        # --- Load Genuine Signatures ---
+        self._load_images(org_dir, 'org')
+        
+        # --- Load Forged Signatures ---
+        self._load_images(forg_dir, 'forg')
 
+        # Filter out users who don't have enough samples for k_shot + q_query
+        self.users = []
+        min_samples_required = k_shot + q_query
+        
+        for uid, data in self.user_data.items():
+            n_org = len(data['org'])
+            n_forg = len(data['forg'])
+            
+            # Condition: User must have enough genuine samples and at least some forgeries
+            if n_org >= min_samples_required and n_forg >= q_query:
+                self.users.append(uid)
+            else:
+                # Optional: Warning for skipped users
+                # print(f"Skipping User {uid}: Insufficient data (Org: {n_org}, Forg: {n_forg})")
+                pass
+        
+        self.users.sort()
+        print(f"Dataset Loaded. Valid Users: {len(self.users)}")
+
+    def _get_user_id(self, filename):
+        """
+        Extracts User ID from CEDAR filename format (e.g., 'original_1_1.png' -> 1).
+        Adjust regex if using a different dataset naming convention.
+        """
+        # Regex for CEDAR/BHSig format usually involves underscores or hyphens
+        # CEDAR: original_1_24.png -> User 1
+        match = re.search(r'_(\d+)_', filename)
+        if match:
+            return int(match.group(1))
+        
+        # Fallback for BHSig or other formats if needed (e.g., BH-Sig uses hyphens)
+        match = re.search(r'-(\d+)-', filename)
+        if match:
+             return int(match.group(1))
+             
+        return None
+
+    def _load_images(self, directory, key):
+        """Helper to crawl directory and populate self.user_data"""
+        if not os.path.exists(directory):
+            raise FileNotFoundError(f"Directory not found: {directory}")
+
+        for f in os.listdir(directory):
+            if f.lower().endswith(self.valid_exts):
+                uid = self._get_user_id(f)
+                
+                # Critical Logic: Filter by specific_users
+                if uid is not None:
+                    if self.specific_users is not None and uid not in self.specific_users:
+                        continue # Skip this file if user is not in allowed list
+
+                    if uid not in self.user_data:
+                        self.user_data[uid] = {'org': [], 'forg': []}
+                    
+                    full_path = os.path.join(directory, f)
+                    self.user_data[uid][key].append(full_path)
 
     def __len__(self):
-        """Returns the number of episodes (users) in the dataset."""
-        return self.length
+        return len(self.users)
 
-    def __getitem__(self, index):
+    def __getitem__(self, idx):
         """
-        Generates a single few-shot learning episode.
-
-        Args:
-            index (int): The index of the user (episode) to retrieve.
-
-        Returns:
-            dict: A dictionary containing the support set images, query set images,
-                  query set labels, and the user ID for the episode. Returns None if
-                  critical errors occur (e.g., unable to load sufficient images).
+        Generates one Episode (Support Set + Query Set) for a specific user.
         """
-        user_id = self.user_ids[index]
-        user_data = self.data[user_id]
+        user_id = self.users[idx]
+        data = self.user_data[user_id]
+        
+        org_paths = data['org']
+        forg_paths = data['forg']
 
-        genuine_paths = user_data.get('genuine', [])
-        forgery_paths = user_data.get('forgery', [])
+        # 1. Sample Genuine Images (Support + Query)
+        # We need k_shot + q_query distinct genuine images
+        # random.sample guarantees unique elements
+        selected_orgs = random.sample(org_paths, self.k_shot + self.q_query)
+        
+        support_paths = selected_orgs[:self.k_shot]
+        query_org_paths = selected_orgs[self.k_shot:]
+        
+        # 2. Sample Forged Images (Query only)
+        # We need q_query forged images
+        selected_forgs = random.sample(forg_paths, self.q_query)
+        query_forg_paths = selected_forgs
 
-        # --- Handle cases with insufficient samples using resampling ---
-        required_genuine = self.k_shot + self.n_query_genuine
-        if not genuine_paths: # No genuine samples available for this user
-             print(f"Warning: No genuine samples found for user {user_id}. Skipping episode by returning None.")
-             return self.__getitem__((index + 1) % len(self)) # Simplest fix: try next user
+        # 3. Load Images and Apply Transforms
+        support_imgs = self._load_batch(support_paths)
+        query_org_imgs = self._load_batch(query_org_paths)
+        query_forg_imgs = self._load_batch(query_forg_paths)
 
-
-        if len(genuine_paths) < required_genuine:
-            # Use random.choices for sampling with replacement
-            genuine_paths = random.choices(genuine_paths, k=required_genuine)
-
-        if not forgery_paths: # Handle case with no forgery samples if needed
-            if self.n_query_forgery > 0 and not forgery_paths:
-                print(f"Warning: No forgery samples found for user {user_id}, but {self.n_query_forgery} were requested. Trying next user.")
-                return self.__getitem__((index + 1) % len(self))
-            elif self.n_query_forgery > 0 and len(forgery_paths) < self.n_query_forgery:
-                 forgery_paths = random.choices(forgery_paths, k=self.n_query_forgery)
-            elif self.n_query_forgery == 0: # If 0 forgeries requested, ensure list is empty
-                 forgery_paths = []
-
-
-        # Shuffle paths before splitting to ensure randomness
-        random.shuffle(genuine_paths)
-        if forgery_paths: random.shuffle(forgery_paths)
-
-        # Create Support Set (k_shot genuine samples)
-        support_paths = genuine_paths[:self.k_shot]
-
-        # Create Query Set (n_query genuine + n_query forgery samples)
-        query_genuine_paths = genuine_paths[self.k_shot : self.k_shot + self.n_query_genuine]
-        query_forgery_paths = forgery_paths[:self.n_query_forgery] # Slicing handles empty list correctly
-
-        query_paths = query_genuine_paths + query_forgery_paths
-        # Ensure labels match the actual number of samples selected
-        query_labels = [1] * len(query_genuine_paths) + [0] * len(query_forgery_paths)
-
-        # Select the appropriate transform based on the 'augment' flag
-        transform_to_apply = self.augment_transform if self.augment else self.base_transform
-
-        # Helper function to load and transform images, with error handling
-        def _load_images(paths):
-            images = []
-            valid_paths = []
-            for p in paths:
-                try:
-                    img = Image.open(p).convert('L')
-                    images.append(img)
-                    valid_paths.append(p)
-                except FileNotFoundError:
-                    print(f"Error: Image file not found at {p}. Skipping.")
-                except Exception as e:
-                    print(f"Error loading image {p}: {e}. Skipping.")
-
-            if not images:
-                return None
-
-            # Apply transformations
-            try:
-                transformed_images = [transform_to_apply(img) for img in images]
-                return torch.stack(transformed_images)
-            except Exception as e:
-                 print(f"Error applying transforms to images (paths: {valid_paths}): {e}")
-                 return None
-
-
-        support_images = _load_images(support_paths)
-        query_images = _load_images(query_paths)
-
-        # Handle potential loading failures
-        if support_images is None or query_images is None or len(query_images) != len(query_labels):
-            print(f"Critical error loading images for user {user_id}. Attempting next user.")
-            return self.__getitem__((index + 1) % len(self))
-
+        # 4. Construct Query Set and Labels
+        # Query Set structure: [Genuine Queries ..., Forged Queries ...]
+        query_imgs = torch.cat([query_org_imgs, query_forg_imgs], dim=0)
+        
+        # Labels: 1 for Genuine, 0 for Forgery
+        # Note: In Metric Learning with Triplet Loss, we might just use embeddings,
+        # but for evaluation (Accuracy/AUC), we need these labels.
+        org_labels = torch.ones(len(query_org_imgs), dtype=torch.long)
+        forg_labels = torch.zeros(len(query_forg_imgs), dtype=torch.long)
+        query_labels = torch.cat([org_labels, forg_labels], dim=0)
 
         return {
-            'support_images': support_images,    # Tensor shape: [k_shot, C, H, W]
-            'query_images': query_images,        # Tensor shape: [n_query_genuine + n_query_forgery, C, H, W]
-            'query_labels': torch.tensor(query_labels, dtype=torch.long), # Tensor shape: [n_query_genuine + n_query_forgery]
-            'user_id': user_id                   # User identifier (string)
+            'user_id': user_id,
+            'support_images': support_imgs, # Shape: (k_shot, C, H, W)
+            'query_images': query_imgs,     # Shape: (2*q_query, C, H, W)
+            'query_labels': query_labels    # Shape: (2*q_query,)
         }
+
+    def _load_batch(self, paths):
+        """Loads a list of image paths into a tensor batch."""
+        imgs = []
+        for p in paths:
+            try:
+                img = Image.open(p).convert('L') # Ensure Grayscale
+                if self.transform:
+                    img = self.transform(img)
+                imgs.append(img)
+            except Exception as e:
+                print(f"Error loading {p}: {e}")
+                # Handling corruption: Create a black image as fallback to avoid crashing
+                # In production, you might want to retry or skip.
+                fallback = torch.zeros((1, 220, 150)) # Assuming rough size, transform usually resizes
+                if self.transform: 
+                    # Create dummy PIL image to pass through transform
+                    fallback_pil = Image.new('L', (150, 220))
+                    fallback = self.transform(fallback_pil)
+                imgs.append(fallback)
+                
+        return torch.stack(imgs)
