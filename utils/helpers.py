@@ -4,6 +4,8 @@ import json
 import kagglehub
 import torch
 import pynvml
+from PIL import Image, ImageOps
+import numpy as np
 
 def load_config(config_path):
     """
@@ -147,3 +149,44 @@ class MemoryTracker:
     def __del__(self):
         # prefer explicit shutdown, but fallback on delete
         self.shutdown()
+
+class ResizeWithPad:
+    """
+    Resizes an image to a target size while preserving its original aspect ratio 
+    by padding the remaining area with a background color (white).
+    This prevents geometric distortion of signature strokes.
+    
+    Attributes:
+        target_size (tuple): Desired output size (width, height).
+        fill (int): Pixel value for padding (default is 255 for white background).
+    """
+    def __init__(self, target_size=(220, 150), fill=255):
+        self.target_size = target_size
+        self.fill = fill
+
+    def __call__(self, img):
+        """
+        Args:
+            img (PIL.Image): Image to be resized.
+
+        Returns:
+            PIL.Image: Resized and padded image.
+        """
+        original_w, original_h = img.size
+        target_w, target_h = self.target_size
+        
+        # Calculate scaling factor to fit within target dimensions
+        scale = min(target_w / original_w, target_h / original_h)
+        new_w = int(original_w * scale)
+        new_h = int(original_h * scale)
+        
+        # Resize the image with high-quality downsampling (BICUBIC)
+        img = img.resize((new_w, new_h), Image.BICUBIC)
+        
+        # Calculate padding dimensions to center the image
+        delta_w = target_w - new_w
+        delta_h = target_h - new_h
+        padding = (delta_w // 2, delta_h // 2, delta_w - (delta_w // 2), delta_h - (delta_h // 2))
+        
+        # Apply padding
+        return ImageOps.expand(img, padding, fill=self.fill)

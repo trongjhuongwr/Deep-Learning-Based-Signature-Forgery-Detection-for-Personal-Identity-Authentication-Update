@@ -4,119 +4,87 @@ import torch.nn.functional as F
 
 class MetricGenerator(nn.Module):
     """
-    Generates a user-specific Mahalanobis matrix (W) from support set embeddings.
+    Implements a Deep Relation Network for Learnable Metric Similarity in One-Shot Learning.
 
-    This module implements an Attention mechanism to compute a weighted prototype
-    of the support set, which is then fed into a generator network to produce
-    a tailored, adaptive metric (Mahalanobis matrix W) for that specific user.
+    Research Context:
+    Traditional Few-Shot Learning approaches, such as Prototypical Networks, rely on 
+    pre-defined distance metrics (e.g., Euclidean or Cosine distance) in the embedding space. 
+    However, in fine-grained tasks like Offline Signature Verification, the manifold of 
+    genuine signatures versus forgeries is often complex and non-linearly separable.
+
+    This module implements a 'Relation Network' (based on Sung et al., CVPR 2018). 
+    Instead of assuming a fixed metric, it learns a non-linear similarity function 
+    (via a Multi-Layer Perceptron) that takes a pair of feature vectors (Support and Query) 
+    and outputs a learnable relation score. This allows the model to capture subtle 
+    intra-class variations (e.g., slant, stroke width) that rigid metrics might miss.
+
+    Mathematical Formalism:
+        Let f(x_s) and f(x_q) be the feature embeddings of the support and query images, respectively.
+        The Relation Module g(.) computes the similarity score r as:
+            r = g( Concat( f(x_s), f(x_q) ) )
+        
+        The network is trained end-to-end to maximize r for genuine pairs and minimize r for forged pairs.
+
+    Attributes:
+        embedding_dim (int): Dimensionality of the concatenated input features (Support + Query). 
+                             Typically 2 * Backbone_Output_Dim.
+        hidden_dim (int): Dimensionality of the hidden latent layer.
     """
-    def __init__(self, embedding_dim, hidden_factor=2, dropout_prob=0.3):
+
+    def __init__(self, embedding_dim=1024, hidden_dim=256, dropout=0.3):
         """
-        Initializes the MetricGenerator.
+        Initializes the Relation Network architecture.
 
         Args:
-            embedding_dim (int): The dimensionality of the input embeddings (e.g., 512).
-            hidden_factor (int): Multiplier for the hidden layer dimension relative to embedding_dim. Defaults to 2.
-            dropout_prob (float): Dropout probability for regularization within the generator network. Defaults to 0.3.
+            embedding_dim (int): The size of the combined feature vector. 
+                                 For ResNet34 backbone (512 dim), this should be 512 + 512 = 1024.
+            hidden_dim (int): The size of the hidden interaction layer. Default: 256.
+            dropout (float): The dropout probability for regularization during training.
         """
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        hidden_dim = embedding_dim * hidden_factor
-
-        # Attention layer to compute weights for the support set samples.
-        # Input: embedding_dim -> Output: 1 (attention score per sample)
-        self.attn = nn.Linear(embedding_dim, 1)
-
-        # A deeper generator network to map the prototype to the matrix parameters.
-        # Input: Prototype vector (embedding_dim)
-        # Output: Flattened W matrix (embedding_dim * embedding_dim)
-        self.generator = nn.Sequential(
+        super(MetricGenerator, self).__init__()
+        
+        # Deep Relation Module (MLP)
+        self.relation_module = nn.Sequential(
+            # 1. Feature Interaction Layer
+            # Projects the high-dimensional concatenated vector into a latent interaction space.
             nn.Linear(embedding_dim, hidden_dim),
+            
+            # 2. Normalization Strategy
+            # LayerNorm is utilized instead of BatchNorm. In Meta-Learning scenarios (N-way K-shot),
+            # batch sizes are often small or consist of episodic data, making BatchNorm statistics unstable.
+            nn.LayerNorm(hidden_dim),
+            
+            # 3. Non-Linear Activation
+            # ReLU introduces non-linearity, enabling the approximation of complex decision boundaries.
             nn.ReLU(),
-            nn.Dropout(dropout_prob), # Add dropout for regularization
-            nn.Linear(hidden_dim, hidden_dim), # Added another hidden layer
-            nn.ReLU(),
-            nn.Linear(hidden_dim, embedding_dim * embedding_dim) # Output flattened matrix parameters
+            
+            # 4. Regularization
+            # Dropout is applied to prevent the relation module from overfitting to specific artifacts
+            # in the training support sets, thereby improving cross-domain generalization.
+            nn.Dropout(dropout),
+            
+            # 5. Scalar Scoring Layer
+            # Projects the latent representation to a single scalar relation score (logit).
+            # Note: No Sigmoid activation is applied here as BCEWithLogitsLoss is used 
+            # in the training loop for better numerical stability.
+            nn.Linear(hidden_dim, 1)
         )
 
-        print(f"Initialized MetricGenerator with Attention. Embedding dim: {embedding_dim}, Hidden dim: {hidden_dim}, Dropout: {dropout_prob}.")
-
-
-    def forward(self, support_embeddings):
+    def forward(self, combined_features):
         """
-        Generates the Mahalanobis matrix W for a given support set.
+        Performs the forward pass to compute the similarity score (relation) between feature pairs.
 
         Args:
-            support_embeddings (torch.Tensor): Embeddings of the support set samples.
-                                                Shape: (k_shot, embedding_dim).
+            combined_features (Tensor): The concatenated feature vectors of support and query images.
+                                        Shape: [Batch_Size, embedding_dim]
+                                        (e.g., [32, 1024])
 
         Returns:
-            torch.Tensor: The generated Mahalanobis matrix W, ensured to be
-                          symmetric and positive semi-definite (PSD).
-                          Shape: (embedding_dim, embedding_dim).
+            similarity_logits (Tensor): The raw similarity scores (logits) indicating the likelihood 
+                                        that the pair belongs to the same identity.
+                                        Shape: [Batch_Size, 1]
         """
-        # Ensure support_embeddings is not empty
-        k_shot = support_embeddings.shape[0]
-        if k_shot == 0:
-            print("Warning: MetricGenerator received empty support_embeddings. Returning Identity matrix.")
-            # Return identity matrix on the same device
-            return torch.eye(self.embedding_dim, device=support_embeddings.device)
-
-        # --- 1. Compute Weighted Prototype via Attention ---
-        # Calculate attention scores for each support sample
-        # (k_shot, embedding_dim) -> (k_shot, 1)
-        try:
-             attn_scores = self.attn(support_embeddings)
-        except Exception as e:
-             print(f"Error during attention score calculation: {e}. Using mean prototype fallback.")
-             # Fallback to simple mean if attention fails
-             prototype = torch.mean(support_embeddings, dim=0, keepdim=True)
-             # Proceed to matrix generation with mean prototype
-             # (Code block duplicated below for clarity, could be refactored)
-             try:
-                 flat_matrix = self.generator(prototype)
-                 W_raw = flat_matrix.view(self.embedding_dim, self.embedding_dim)
-                 W_sym = (W_raw + W_raw.t()) / 2
-                 epsilon = 1e-6
-                 W_psd = W_sym + (epsilon * torch.eye(self.embedding_dim, device=W_sym.device))
-                 return W_psd
-             except Exception as gen_e:
-                 print(f"Error during generator forward pass after fallback: {gen_e}")
-                 return torch.eye(self.embedding_dim, device=support_embeddings.device) # Final fallback
-
-        # Apply softmax to get normalized attention weights (sum to 1)
-        attn_weights = F.softmax(attn_scores, dim=0) # Shape: (k_shot, 1)
-
-        # Compute the weighted average prototype
-        # Element-wise multiply embeddings by weights: (k_shot, embedding_dim) * (k_shot, 1)
-        # Sum across the k_shot dimension: -> (1, embedding_dim)
-        prototype = torch.sum(support_embeddings * attn_weights, dim=0, keepdim=True)
-
-        # --- 2. Generate Flattened Matrix ---
-        # Pass the calculated prototype through the generator network
-        try:
-             flat_matrix = self.generator(prototype) # Shape: (1, embedding_dim * embedding_dim)
-        except Exception as e:
-             print(f"Error during generator forward pass: {e}")
-             # Fallback to Identity if generator fails
-             return torch.eye(self.embedding_dim, device=support_embeddings.device)
-
-        # --- 3. Reshape into Square Matrix ---
-        try:
-             W_raw = flat_matrix.view(self.embedding_dim, self.embedding_dim)
-        except Exception as e:
-             print(f"DEBUG (MetricGenerator): ERROR during flat_matrix.view: {e}")
-             # Fallback if reshape fails
-             return torch.eye(self.embedding_dim, device=support_embeddings.device)
-
-
-        # --- 4. Ensure W is Symmetric and Positive Semi-Definite (PSD) ---
-        # Enforce Symmetry: W_sym = (W_raw + W_raw^T) / 2
-        W_sym = (W_raw + W_raw.t()) / 2
-
-        # Enforce Positive Semi-Definite (PSD) by adding a small diagonal bias (epsilon * I)
-        # This is a numerically stable method to ensure eigenvalues > 0.
-        epsilon = 1e-6
-        W_psd = W_sym + (epsilon * torch.eye(self.embedding_dim, device=W_sym.device))
-
-        return W_psd
+        # Compute the non-linear relation score
+        similarity_logits = self.relation_module(combined_features)
+        
+        return similarity_logits

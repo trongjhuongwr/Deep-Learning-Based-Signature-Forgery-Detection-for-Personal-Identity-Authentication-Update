@@ -77,7 +77,7 @@ Experimental results demonstrate the state-of-the-art performance and robustness
 ## Installation
 1.  **Clone the repository**:
     ```bash
-    git clone [https://github.com/trongjhuongwr/Deep-Learning-Based-Signature-Forgery-Detection-for-Personal-Identity-Authentication.git](https://github.com/trongjhuongwr/Deep-Learning-Based-Signature-Forgery-Detection-for-Personal-Identity-Authentication.git)
+    git clone https://github.com/Tommyhuy1705/Deep_Learning-Based_Signature_Forgery_Detection_for_Personal_Identity_Authentication.git
     cd Deep-Learning-Based-Signature-Forgery-Detection-for-Personal-Identity-Authentication
     ```
 
